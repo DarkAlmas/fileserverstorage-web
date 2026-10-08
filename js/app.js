@@ -617,15 +617,23 @@ async function openStoredFile(item) {
     setLoading(true, 'Открытие файла…');
     const url = await openFileUrl(item);
     setLoading(false);
-    if (!url) {
-      showToast('Не удалось получить ссылку на файл');
-      return;
-    }
-    window.open(url, '_blank', 'noopener,noreferrer');
+    // window.open после await браузеры молча блокируют как всплывающее окно.
+    // Ссылка содержит download=<имя>, Supabase отвечает Content-Disposition: attachment —
+    // обычный клик по <a> скачивает файл, не уходя со страницы.
+    const link = document.createElement('a');
+    link.href = url;
+    link.rel = 'noopener noreferrer';
+    link.download = item.name || '';
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    showToast(`Скачивание началось: ${item.name || 'файл'}`);
   } catch (error) {
-    console.error(error);
+    console.error('Download failed', error);
     setLoading(false);
-    showToast(error && error.code === 'untrusted-url' ? error.message : 'Не удалось получить ссылку на файл');
+    const known = error && (error.code === 'untrusted-url' || error.code === 'no-url');
+    showToast(known ? error.message : 'Не удалось получить ссылку на файл (нет доступа или файл не найден на сервере)');
   }
 }
 

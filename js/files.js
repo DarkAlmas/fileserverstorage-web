@@ -24,6 +24,7 @@ import {
   deleteStoredFile,
   insertShare,
   isTrustedStorageUrl,
+  withDownloadName,
   listIncomingShares,
 } from './storage.js';
 
@@ -389,12 +390,18 @@ export async function openFileUrl(item) {
     // Старые «отправки» из Firestore: downloadUrl записал другой человек — не доверяем ему.
     url = item.downloadUrl || null;
   }
+  if (!url) {
+    const err = new Error('У файла нет ссылки для скачивания');
+    err.code = 'no-url';
+    throw err;
+  }
   if (!isTrustedStorageUrl(url)) {
+    console.error('Untrusted storage URL', url);
     const err = new Error('Небезопасная ссылка на файл — открытие заблокировано');
     err.code = 'untrusted-url';
     throw err;
   }
-  return url;
+  return withDownloadName(url, item.name || '');
 }
 
 export async function loadAccountStats(ownerEmail) {

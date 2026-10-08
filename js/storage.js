@@ -135,8 +135,47 @@ export async function createSignedUrl(storagePath, expiresInSeconds) {
   }
   const json = await response.json();
   const signedURL = json && json.signedURL;
-  if (!signedURL) throw new Error('Sign response missing signedURL');
-  return `${SUPABASE_URL}/storage/v1${signedURL}`;
+  const signedToken = extractSignedToken(signedURL);
+  if (!signedToken) throw new Error('Sign response missing token');
+  // Supabase отдаёт путь в signedURL НЕ закодированным (пробелы, «#», «%», «?» в имени ломают ссылку),
+  // поэтому собираем ссылку сами из закодированного пути и токена.
+  return buildSignedUrl(storagePath, signedToken);
+}
+
+/** Токен из ответа /object/sign: последний «?token=» (путь может сам содержать «?»). */
+export function extractSignedToken(signedURL) {
+  if (typeof signedURL !== 'string') return null;
+  const start = Math.max(signedURL.lastIndexOf('?token='), signedURL.lastIndexOf('&token='));
+  if (start < 0) return null;
+  let raw = signedURL.slice(start + '?token='.length);
+  const amp = raw.indexOf('&');
+  if (amp >= 0) raw = raw.slice(0, amp);
+  let token;
+  try {
+    token = decodeURIComponent(raw);
+  } catch (error) {
+    return null;
+  }
+  return /^[A-Za-z0-9._-]+$/.test(token) ? token : null;
+}
+
+export function buildSignedUrl(storagePath, signedToken, downloadName) {
+  let url = `${signUrl(storagePath)}?token=${encodeURIComponent(signedToken)}`;
+  if (downloadName) url += `&download=${encodeURIComponent(downloadName)}`;
+  return url;
+}
+
+/** Добавляет download=<имя>: Supabase отдаст файл как вложение (Content-Disposition: attachment). */
+export function withDownloadName(signedUrl, name) {
+  if (!name) return signedUrl;
+  let url;
+  try {
+    url = new URL(signedUrl);
+  } catch (error) {
+    return signedUrl;
+  }
+  if (url.searchParams.has('download')) return signedUrl;
+  return `${signedUrl}&download=${encodeURIComponent(name)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +280,9 @@ export function isTrustedStorageUrl(raw) {
     url.origin === base.origin &&
     !url.username &&
     !url.password &&
-    url.pathname.startsWith('/storage/v1/')
+    !url.hash &&
+    !raw.includes('#') &&
+    url.pathname.startsWith('/storage/v1/') &&
+    !/\/\.\.?(\/|$)/.test(url.pathname)
   );
 }

@@ -57,6 +57,21 @@ function authHeaders(token, extra = {}) {
   };
 }
 
+/**
+ * Запрос к Supabase (REST/Storage) со свежим Firebase ID-токеном: токен берётся прямо перед
+ * запросом (Firebase сам обновляет истёкший), при 401 — ровно один повтор с getIdToken(true).
+ * Статического заголовка/кэша токена нет. `getToken` и `doFetch` — для тестов.
+ */
+export async function supabaseFetch(url, init = {}, getToken = firebaseIdToken, doFetch = (u, i) => fetch(u, i)) {
+  const withToken = (token) => ({ ...init, headers: authHeaders(token, init.headers || {}) });
+  let response = await doFetch(url, withToken(await getToken(false)));
+  if (response.status === 401) {
+    console.warn('Supabase 401, retry with refreshed token', url.split('?')[0]);
+    response = await doFetch(url, withToken(await getToken(true)));
+  }
+  return response;
+}
+
 function safeFileName(fileName) {
   return String(fileName).replace(/[^a-zA-Z0-9._-]/g, '_');
 }
@@ -107,11 +122,7 @@ function putObject(path, file, token, mime, onProgress) {
 }
 
 export async function deleteStoredFile(storagePath) {
-  const token = await firebaseIdToken();
-  const response = await fetch(objectUrl(storagePath), {
-    method: 'DELETE',
-    headers: authHeaders(token),
-  });
+  const response = await supabaseFetch(objectUrl(storagePath), { method: 'DELETE' });
   if (!response.ok) {
     const body = await response.text().catch(() => '');
     throw new Error(body || `Delete failed: ${response.status}`);
@@ -123,10 +134,9 @@ export async function deleteStoredFile(storagePath) {
  * Ответ: { signedURL } → SUPABASE_URL + "/storage/v1" + signedURL
  */
 export async function createSignedUrl(storagePath, expiresInSeconds) {
-  const token = await firebaseIdToken();
-  const response = await fetch(signUrl(storagePath), {
+  const response = await supabaseFetch(signUrl(storagePath), {
     method: 'POST',
-    headers: authHeaders(token, { 'Content-Type': 'application/json' }),
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ expiresIn: expiresInSeconds }),
   });
   if (!response.ok) {
@@ -205,11 +215,10 @@ export async function insertShare(ownerUid, recipientUid, path, fileName) {
   if (!isShareablePath(path, ownerUid)) {
     throw new ShareError('bad-path', 'Этот файл загружен в старом формате — отправить его пока нельзя');
   }
-  const token = await firebaseIdToken();
   const name = String(fileName || 'file').slice(0, 255) || 'file';
-  const response = await fetch(SHARES_URL, {
+  const response = await supabaseFetch(SHARES_URL, {
     method: 'POST',
-    headers: authHeaders(token, { 'Content-Type': 'application/json', Prefer: 'return=minimal' }),
+    headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
     body: JSON.stringify({ owner_uid: ownerUid, recipient_uid: recipientUid, path, file_name: name }),
   });
   if (response.status === 409) {
@@ -224,11 +233,10 @@ export async function insertShare(ownerUid, recipientUid, path, fileName) {
 
 /** Входящие: [{ id, owner_uid, path, file_name, created_at }] */
 export async function listIncomingShares(myUid) {
-  const token = await firebaseIdToken();
   const url =
     `${SHARES_URL}?select=id,owner_uid,path,file_name,created_at` +
     `&recipient_uid=eq.${encodeURIComponent(myUid)}&order=created_at.desc`;
-  const response = await fetch(url, { headers: authHeaders(token) });
+  const response = await supabaseFetch(url);
   if (!response.ok) {
     const body = await response.text().catch(() => '');
     throw new Error(body || `Shares list failed: ${response.status}`);
@@ -237,10 +245,9 @@ export async function listIncomingShares(myUid) {
 }
 
 async function deleteShares(filter) {
-  const token = await firebaseIdToken();
-  const response = await fetch(`${SHARES_URL}?${filter}`, {
+  const response = await supabaseFetch(`${SHARES_URL}?${filter}`, {
     method: 'DELETE',
-    headers: authHeaders(token, { Prefer: 'return=minimal' }),
+    headers: { Prefer: 'return=minimal' },
   });
   if (!response.ok) {
     const body = await response.text().catch(() => '');

@@ -17,8 +17,9 @@ import {
   EmailAuthProvider,
   GoogleAuthProvider,
   createUserWithEmailAndPassword,
+  inMemoryPersistence,
+  initializeAuth,
   linkWithCredential,
-  reauthenticateWithCredential,
   sendEmailVerification,
   sendPasswordResetEmail,
   signInWithEmailAndPassword,
@@ -34,7 +35,8 @@ import {
   serverTimestamp,
   setDoc,
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
-import { auth, db } from './firebase.js';
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js';
+import { app, auth, db } from './firebase.js';
 
 export const USERS = 'Users';
 export const USERNAMES = 'Usernames';
@@ -92,7 +94,43 @@ export function validateNewPassword(password) {
 
 /** Почта не подтверждена — доступ к файлам закрыт. Google-аккаунты уже подтверждены. */
 export function needsEmailVerification(user) {
-  return !!(user && user.email && !user.emailVerified);
+  return !!(user && user.email && !user.emailVerified && !isGoogleSession(user));
+}
+
+// --- Провайдер ТЕКУЩЕЙ сессии (claim firebase.sign_in_provider из ID-токена) ---
+// Google-сессия считается подтверждённой, даже если у аккаунта emailVerified === false.
+// Берём провайдер из токена, а не из providerData: вход по паролю в аккаунт с привязанным
+// Google по-прежнему требует подтверждения почты (так же решают правила Firestore).
+let sessionUid = null;
+let sessionSignInProvider = null;
+
+export function isGoogleSession(user) {
+  return !!user && user.uid === sessionUid && sessionSignInProvider === 'google.com';
+}
+
+function clearSessionProvider() {
+  sessionUid = null;
+  sessionSignInProvider = null;
+}
+
+async function loadSessionProvider(user, forceRefresh = false) {
+  try {
+    const result = await user.getIdTokenResult(forceRefresh);
+    sessionUid = user.uid;
+    sessionSignInProvider = result.signInProvider || null;
+  } catch (error) {
+    console.warn('getIdTokenResult failed', error);
+  }
+}
+
+/** Отдельный Auth только для проверки «пароля защиты» (не трогает основную сессию). */
+let passwordCheckAuthInstance = null;
+function passwordCheckAuth() {
+  if (!passwordCheckAuthInstance) {
+    const checkerApp = initializeApp(app.options, 'password-check');
+    passwordCheckAuthInstance = initializeAuth(checkerApp, { persistence: inMemoryPersistence });
+  }
+  return passwordCheckAuthInstance;
 }
 
 /** Ключ владельца файлов (поле Files.ownerEmail) — email, как и раньше. */
@@ -201,6 +239,7 @@ export class AuthManager {
       const provider = new GoogleAuthProvider();
       provider.addScope('email');
       provider.setCustomParameters({ prompt: 'select_account' });
+      clearSessionProvider();
       const result = await signInWithPopup(auth, provider);
       if (!result.user) {
         cb.onHideLoading();
@@ -230,6 +269,7 @@ export class AuthManager {
     if (!cb) return;
     cb.onShowLoading();
     try {
+      clearSessionProvider();
       await signInWithEmailAndPassword(auth, email.trim(), password);
       this.registerSuccess();
       // Пароль только что введён — «пароль защиты» повторно не спрашиваем.
@@ -254,6 +294,7 @@ export class AuthManager {
     }
     cb.onShowLoading();
     try {
+      clearSessionProvider();
       const result = await createUserWithEmailAndPassword(auth, email.trim(), password);
       this.registerSuccess();
       this.isFirstLoginAfterAppStart = true;
@@ -299,6 +340,11 @@ export class AuthManager {
     const user = auth.currentUser;
     const cb = this.callback;
     if (!user || !cb) return;
+    if (!needsEmailVerification(user)) {
+      // Почта уже подтверждена или это Google-сессия — письмо не нужно.
+      await this.checkUserStatusAndRoute();
+      return;
+    }
     const left = this.verificationResendSecondsLeft();
     if (left > 0) {
       cb.onError('Письмо можно отправить ещё раз через ' + left + ' с');
@@ -335,15 +381,12 @@ export class AuthManager {
         cb.onUnauthenticated();
         return;
       }
-      if (!user.emailVerified) {
+      // Обновляем токен: в нём появится email_verified = true, заодно узнаём провайдер сессии.
+      await loadSessionProvider(user, true);
+      if (needsEmailVerification(user)) {
         cb.onHideLoading();
         cb.onError('Почта ещё не подтверждена. Откройте ссылку из письма и нажмите кнопку снова');
         return;
-      }
-      try {
-        await user.getIdToken(true);
-      } catch (error) {
-        console.error('token refresh failed', error);
       }
       await this.checkUserStatusAndRoute();
     } catch (error) {
@@ -364,6 +407,9 @@ export class AuthManager {
       cb.onUnauthenticated();
       return;
     }
+
+    // Сначала узнаём провайдер текущей сессии (Google-сессию не держим на экране подтверждения).
+    if (sessionUid !== user.uid || !sessionSignInProvider) await loadSessionProvider(user);
 
     if (needsEmailVerification(user)) {
       this.isLoggedIn = false;
@@ -621,6 +667,7 @@ export class AuthManager {
     try {
       const credential = EmailAuthProvider.credential(user.email, password);
       await linkWithCredential(user, credential);
+      clearSessionProvider(); // токен обновился — провайдер сессии перечитаем из него
       cb.onHideLoading();
       this.isFirstLoginAfterAppStart = false;
       if (auth.currentUser) await this.upsertUserProfile(auth.currentUser, null);
@@ -640,8 +687,14 @@ export class AuthManager {
 
     cb.onShowLoading();
     try {
-      const credential = EmailAuthProvider.credential(user.email, password);
-      await reauthenticateWithCredential(user, credential);
+      // Пароль проверяем входом в ОТДЕЛЬНЫЙ экземпляр Auth, а не reauthenticate: он заменил бы
+      // токен сессии на sign_in_provider = password, и Google-сессия с неподтверждённой почтой
+      // упёрлась бы в «Подтвердите почту» и в правила.
+      const checker = passwordCheckAuth();
+      const check = await signInWithEmailAndPassword(checker, user.email, password);
+      const sameUser = check.user && check.user.uid === user.uid;
+      await firebaseSignOut(checker).catch(() => {});
+      if (!sameUser) throw new Error('password check: different user');
       this.registerSuccess();
       cb.onHideLoading();
       this.isLoggedIn = true;
@@ -702,6 +755,7 @@ export class AuthManager {
   }
 
   resetSession() {
+    clearSessionProvider();
     this.isLoggedIn = false;
     this.currentUsername = '';
     this.isFirstLoginAfterAppStart = false;

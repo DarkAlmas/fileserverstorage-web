@@ -45,12 +45,24 @@ export const PRIVATE = 'private';
 export const PRIVATE_PROFILE = 'profile';
 const NICK_TAKEN = 'nickname-taken';
 const NICKNAME_RE = /^[A-Za-zА-Яа-яЁё0-9_]{3,20}$/;
+// Один алфавит на ник (защита от подмены похожими буквами: «а» кириллицей vs «a» латиницей).
+const NICK_LATIN_RE = /^[a-z0-9_]{3,20}$/;
+const NICK_CYRILLIC_RE = /^[а-яё0-9_]{3,20}$/;
+
+/** Для поиска: старые (уже закреплённые) ники со смешанным алфавитом тоже находятся. */
+export function isSearchableNickname(nickname) {
+  return NICKNAME_RE.test(String(nickname || '').trim());
+}
 
 /** null — ник подходит; иначе текст ошибки. */
 export function validateNickname(nickname) {
   const n = String(nickname || '').trim();
   if (n.length < 3 || n.length > 20) return 'Ник должен быть от 3 до 20 символов';
   if (!NICKNAME_RE.test(n)) return 'В нике можно использовать только буквы, цифры и _';
+  const key = n.toLowerCase();
+  if (!NICK_LATIN_RE.test(key) && !NICK_CYRILLIC_RE.test(key)) {
+    return 'Ник должен быть либо латиницей, либо кириллицей';
+  }
   return null;
 }
 
@@ -619,7 +631,7 @@ export class AuthManager {
     const oldKey = oldName ? nicknameKey(oldName) : null;
     const newRef = doc(db, USERNAMES, newKey);
     const oldRef =
-      oldKey && oldKey !== newKey && validateNickname(oldName) === null
+      oldKey && oldKey !== newKey && !oldKey.includes("/")
         ? doc(db, USERNAMES, oldKey)
         : null;
 

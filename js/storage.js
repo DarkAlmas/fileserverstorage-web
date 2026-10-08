@@ -220,3 +220,27 @@ export function deleteSharesForPath(ownerUid, path) {
     `owner_uid=eq.${encodeURIComponent(ownerUid)}&path=eq.${encodeURIComponent(path)}`,
   );
 }
+
+/**
+ * Открывать можно только ссылки на наш Supabase Storage: https, тот же origin, что у
+ * SUPABASE_URL, и путь /storage/v1/... URL разбирается через new URL (нормализует «..»,
+ * %2e и т.п.), сравниваются origin и pathname, а не сырая строка.
+ */
+export function isTrustedStorageUrl(raw) {
+  if (typeof raw !== 'string' || !raw) return false;
+  let url;
+  let base;
+  try {
+    url = new URL(raw);
+    base = new URL(SUPABASE_URL);
+  } catch (error) {
+    return false;
+  }
+  return (
+    url.protocol === 'https:' &&
+    url.origin === base.origin &&
+    !url.username &&
+    !url.password &&
+    url.pathname.startsWith('/storage/v1/')
+  );
+}

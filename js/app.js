@@ -622,7 +622,7 @@ async function openStoredFile(item) {
   } catch (error) {
     console.error(error);
     setLoading(false);
-    showToast('Не удалось получить ссылку на файл');
+    showToast(error && error.code === 'untrusted-url' ? error.message : 'Не удалось получить ссылку на файл');
   }
 }
 

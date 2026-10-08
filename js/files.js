@@ -15,13 +15,14 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
 import { MAX_STORAGE_BYTES, SIGNED_URL_TTL_OPEN } from './config.js';
 import { auth, db } from './firebase.js';
-import { nicknameKey, validateNickname } from './auth.js';
+import { isSearchableNickname, nicknameKey } from './auth.js';
 import {
   createSignedUrl,
   deleteShare,
   deleteSharesForPath,
   deleteStoredFile,
   insertShare,
+  isTrustedStorageUrl,
   listIncomingShares,
 } from './storage.js';
 
@@ -308,7 +309,7 @@ export async function deleteFolderRecord(folder) {
  */
 export async function searchUsersByNick(nick, _myEmail, myUid) {
   const text = String(nick || '').trim();
-  if (!text || validateNickname(text)) return [];
+  if (!text || !isSearchableNickname(text)) return [];
   const claim = await getDoc(doc(db, 'Usernames', nicknameKey(text)));
   if (!claim.exists()) return [];
   const uid = claim.data().uid;
@@ -379,11 +380,20 @@ export async function loadIncomingShareItems() {
 }
 
 export async function openFileUrl(item) {
+  let url;
   // Свой файл или входящий из public.shares — ссылку создаём в момент открытия.
   if ((!isReceived(item) || item.shareId) && item.storagePath) {
-    return createSignedUrl(item.storagePath, SIGNED_URL_TTL_OPEN);
+    url = await createSignedUrl(item.storagePath, SIGNED_URL_TTL_OPEN);
+  } else {
+    // Старые «отправки» из Firestore: downloadUrl записал другой человек — не доверяем ему.
+    url = item.downloadUrl || null;
   }
-  return item.downloadUrl || null;
+  if (!isTrustedStorageUrl(url)) {
+    const err = new Error('Небезопасная ссылка на файл — открытие заблокировано');
+    err.code = 'untrusted-url';
+    throw err;
+  }
+  return url;
 }
 
 export async function loadAccountStats(ownerEmail) {

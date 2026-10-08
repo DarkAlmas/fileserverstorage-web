@@ -385,7 +385,21 @@ export async function openFileUrl(item) {
   let url;
   // Свой файл или входящий из public.shares — ссылку создаём в момент открытия.
   if ((!isReceived(item) || item.shareId) && item.storagePath) {
-    url = await createSignedUrl(item.storagePath, SIGNED_URL_TTL_OPEN);
+    // Старая запись (путь не в users/<мой uid>/): объект скопирован на сервере в СВОЮ папку
+    // users/<мой uid>/<то же имя>. Только для своих файлов и только своя папка.
+    const me = auth.currentUser;
+    const ownCopy = !isReceived(item) && me ? legacyNewPath(item.storagePath, me.uid) : null;
+    if (ownCopy) {
+      try {
+        url = await createSignedUrl(ownCopy, SIGNED_URL_TTL_OPEN);
+        console.warn(`legacy path ${item.storagePath} -> ${ownCopy}`);
+        migrationDoneFor = null;
+        migrateLegacyFiles(); // перенести запись, раз копия есть
+      } catch (error) {
+        url = null;
+      }
+    }
+    if (!url) url = await createSignedUrl(item.storagePath, SIGNED_URL_TTL_OPEN);
   } else {
     // Старые «отправки» из Firestore: downloadUrl записал другой человек — не доверяем ему.
     url = item.downloadUrl || null;
@@ -481,9 +495,17 @@ export async function migrateLegacyFiles() {
     } catch (error) {
       console.warn('migration: query by ownerUid failed', error);
     }
+    console.info(`legacy migration: byEmail=${byEmail.size} total=${mine.size}`);
     for (const old of mine.values()) {
       const data = old.data();
-      if (data.isFolder || data.sharedBy || data.sharedByUid) continue;
+      if (data.isFolder || data.sharedBy || data.sharedByUid) {
+        if (data.storagePath && !String(data.storagePath).startsWith(`users/${uid}/`)) {
+          console.warn(`migration: not migrated ${old.id}`, {
+            path: data.storagePath, isFolder: data.isFolder, sharedBy: data.sharedBy, sharedByUid: data.sharedByUid,
+          });
+        }
+        continue;
+      }
       const newPath = legacyNewPath(data.storagePath, uid);
       if (!newPath) continue;
       // Объект должен уже лежать по новому пути (его скопировали на сервере).

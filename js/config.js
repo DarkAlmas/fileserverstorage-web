@@ -39,7 +39,7 @@ export const SUPABASE_URL = 'https://zehkfdbhxhymjwkghklm.supabase.co';
 
 /** Публикуемый ключ (publishable / anon) — SupabaseManager.SUPABASE_ANON_KEY */
 export const SUPABASE_ANON_KEY =
-  'sb_publishable_9SSD5bzBCjTa5gEz6-S5qQ_4IQxZ9Xs';
+  'sb_publishable_b2iSNRHBrMDkSxLK8XwAyg__XgxNSh3';
 
 /** Бакет хранилища — SupabaseManager.BUCKET */
 export const SUPABASE_BUCKET = 'user-files';

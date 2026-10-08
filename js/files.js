@@ -14,7 +14,7 @@ import {
   where,
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
 import { MAX_STORAGE_BYTES, SIGNED_URL_TTL_OPEN, SIGNED_URL_TTL_UPLOAD } from './config.js';
-import { db } from './firebase.js';
+import { auth, db } from './firebase.js';
 import { createSignedUrl, deleteStoredFile } from './storage.js';
 
 export const INBOX_PREFIX = '!';
@@ -204,6 +204,7 @@ export async function createFolderRecord(name, currentFolder, ownerEmail) {
     isFolder: true,
     parent: currentFolder,
     ownerEmail,
+    ownerUid: auth.currentUser ? auth.currentUser.uid : null,
     uploadedAt: Date.now(),
     size: 0,
   });
@@ -217,6 +218,7 @@ export async function addFileRecord(file, result, ownerEmail, folder) {
     size: file.size,
     uploadedAt: Date.now(),
     ownerEmail,
+    ownerUid: auth.currentUser ? auth.currentUser.uid : null,
     contentType: file.type || 'application/octet-stream',
     parent: folder,
     isFolder: false,
@@ -255,21 +257,33 @@ export async function deleteFolderRecord(folder) {
   await deleteDoc(doc(db, 'Files', folder.id));
 }
 
-export async function searchUsersByNick(nick, myEmail) {
+/**
+ * Поиск по нику. Email нужен только для записи Files.ownerEmail получателя —
+ * в интерфейсе показывается только ник. Старый (Users/{email}) и новый
+ * (Users/{uid}) документ одного человека дают один результат.
+ */
+export async function searchUsersByNick(nick, myEmail, myUid) {
   const snap = await getDocs(
     query(collection(db, 'Users'), where('userName', '==', nick), limit(20)),
   );
   const hits = [];
+  const seen = new Set();
   snap.forEach((d) => {
-    const email = d.id;
+    const data = d.data();
+    const email = data.email || (d.id.includes('@') ? d.id : null);
+    if (!email) return;
+    const uid = data.uid || null;
     if (myEmail && email.toLowerCase() === myEmail.toLowerCase()) return;
-    const name = d.data().userName;
-    hits.push({ email, username: name || email });
+    if (myUid && uid === myUid) return;
+    const key = uid || email.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    hits.push({ email, uid, username: data.displayName || data.userName || 'Пользователь' });
   });
   return hits;
 }
 
-export async function sendFileToUser(file, hit, myEmail) {
+export async function sendFileToUser(file, hit, myEmail, senderName) {
   if (!file.storagePath) {
     throw new Error('Не удалось получить ссылку на файл');
   }
@@ -286,10 +300,13 @@ export async function sendFileToUser(file, hit, myEmail) {
     size: file.size,
     uploadedAt: Date.now(),
     ownerEmail: hit.email,
+    ownerUid: hit.uid || null,
     contentType: file.contentType,
-    parent: inboxFolderFor(myEmail),
+    // Папка у получателя «От: <ник>» — email отправителя не показываем.
+    parent: inboxFolderFor(String(senderName || 'пользователя').replace(/\//g, '_')),
     isFolder: false,
     sharedBy: myEmail,
+    sharedByUid: auth.currentUser ? auth.currentUser.uid : null,
   });
 }
 

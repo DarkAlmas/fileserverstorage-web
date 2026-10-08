@@ -121,8 +121,7 @@
         <div id="layout-initial" class="auth-card" hidden>
           <h2 class="profile-title">Войдите в профиль</h2>
           <p class="profile-subtitle">Выберите удобный способ для авторизации</p>
-          <button type="button" class="btn btn-primary btn-block" id="btn-login-phone">По номеру телефона</button>
-          <button type="button" class="btn btn-tonal btn-block" id="btn-login-email">Через Email / Почту</button>
+          <button type="button" class="btn btn-primary btn-block" id="btn-login-email">Через Email / Почту</button>
           <button type="button" class="btn btn-elevated btn-block" id="btn-login-google">
             <svg class="google-icon" viewBox="0 0 24 24" aria-hidden="true">
               <path fill="#4285F4" d="M23.49 12.27c0-.79-.07-1.54-.2-2.27H12v4.51h6.48a5.54 5.54 0 0 1-2.4 3.63v3.01h3.87c2.26-2.08 3.54-5.15 3.54-8.88z"/>
@@ -132,6 +131,37 @@
             </svg>
             Войти с Google
           </button>
+        </div>
+
+        <form id="layout-email-login" class="auth-card" hidden novalidate>
+          <h2 class="profile-title">Вход по почте</h2>
+          <p class="profile-subtitle">Введите почту и пароль</p>
+          <label class="field-label">
+            Email
+            <input type="email" class="field" id="et-login-email" autocomplete="email" inputmode="email" maxlength="254">
+          </label>
+          <label class="field-label">
+            Пароль
+            <input type="password" class="field" id="et-login-password" autocomplete="current-password">
+          </label>
+          <label class="field-label" id="row-login-password-confirm" hidden>
+            Повторите пароль
+            <input type="password" class="field" id="et-login-password-confirm" autocomplete="new-password">
+          </label>
+          <p class="muted" id="tv-login-hint" style="text-align:left;font-size:0.8rem;margin:-4px 0 14px" hidden></p>
+          <button type="submit" class="btn btn-primary btn-block" id="btn-login-submit">Войти</button>
+          <button type="button" class="btn btn-text btn-block" id="btn-forgot-password">Забыли пароль?</button>
+          <button type="button" class="btn btn-text btn-block" id="btn-toggle-register">Нет аккаунта? Зарегистрироваться</button>
+          <button type="button" class="btn btn-text btn-block" id="btn-login-back">Назад</button>
+        </form>
+
+        <div id="layout-verify-email" class="auth-card" hidden>
+          <svg class="success-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm0 4-8 5-8-5V6l8 5 8-5v2z"/></svg>
+          <h2 class="profile-title">Подтвердите почту</h2>
+          <p class="profile-subtitle">Мы отправили письмо со ссылкой. Перейдите по ней, затем нажмите «Я подтвердил».</p>
+          <button type="button" class="btn btn-primary btn-block" id="btn-verify-done">Я подтвердил</button>
+          <button type="button" class="btn btn-tonal btn-block" id="btn-verify-resend">Отправить письмо ещё раз</button>
+          <button type="button" class="btn btn-text btn-block" id="btn-verify-logout">Выйти</button>
         </div>
 
         <div id="layout-username" class="auth-card" hidden>

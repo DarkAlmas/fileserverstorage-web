@@ -23,7 +23,13 @@ export class UploadTooLargeError extends Error {
 export async function firebaseIdToken(forceRefresh = false) {
   const user = auth.currentUser;
   if (!user) throw new Error('Нет авторизованного пользователя');
-  const token = await user.getIdToken(forceRefresh);
+  let result = await user.getIdTokenResult(forceRefresh);
+  // Supabase пускает только с email_verified = true. Если почту уже подтвердили,
+  // а в закэшированном токене ещё false — принудительно обновляем токен.
+  if (user.emailVerified && result.claims.email_verified !== true) {
+    result = await user.getIdTokenResult(true);
+  }
+  const token = result.token;
   if (!token) throw new Error('Пустой Firebase ID token');
   return token;
 }

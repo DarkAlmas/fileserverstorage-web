@@ -1,7 +1,13 @@
 import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
 import { MAX_STORAGE_BYTES, MAX_UPLOAD_BYTES } from './config.js';
 import { auth } from './firebase.js';
-import { authManager, hasEmailPasswordProvider } from './auth.js';
+import {
+  authManager,
+  hasEmailPasswordProvider,
+  isValidEmail,
+  MIN_PASSWORD_LENGTH,
+  validateNewPassword,
+} from './auth.js';
 import { UploadTooLargeError, uploadFile } from './storage.js';
 import {
   applyFilter,
@@ -40,6 +46,8 @@ const state = {
   currentFolder: '',
   filesUnsub: null,
   menuItem: null,
+  registerMode: false,
+  resendTimer: null,
 };
 
 function getTheme() {
@@ -125,6 +133,8 @@ function showView(name) {
 function hideAllProfileSteps() {
   [
     'layout-initial',
+    'layout-email-login',
+    'layout-verify-email',
     'layout-username',
     'layout-password',
     'layout-check-password',
@@ -174,6 +184,9 @@ authManager.setCallback({
   },
   onUserAuthenticated(username, showDashboardImmediately) {
     setLoading(false);
+    stopResendTimer();
+    $('et-login-password').value = '';
+    $('et-login-password-confirm').value = '';
     hideAllProfileSteps();
     bindAccountInfo(username);
     if (showDashboardImmediately) {
@@ -197,7 +210,128 @@ authManager.setCallback({
   onError(message) {
     showToast(message);
   },
+  onInfo(message) {
+    showToast(message);
+  },
+  onEmailVerificationRequired(email) {
+    setLoading(false);
+    $('et-login-password').value = '';
+    $('et-login-password-confirm').value = '';
+    showProfileStep(
+      'layout-verify-email',
+      'Подтвердите почту',
+      'Мы отправили письмо на ' + email +
+        '. Перейдите по ссылке в письме, затем нажмите «Я подтвердил». Пока почта не подтверждена, файлы недоступны.',
+    );
+    if (state.view !== 'profile') showView('profile');
+    startResendTimer();
+    stopFilesListener();
+    refreshHome();
+    refreshSettings();
+  },
 });
+
+// --- Вход и регистрация по почте ---
+
+function showEmailLogin(register) {
+  state.registerMode = register;
+  setVisible($('row-login-password-confirm'), register);
+  setVisible($('btn-forgot-password'), !register);
+  setVisible($('tv-login-hint'), register);
+  $('tv-login-hint').textContent =
+    'Пароль — не короче ' + MIN_PASSWORD_LENGTH +
+    ' символов. После регистрации мы пришлём письмо: почту нужно подтвердить, чтобы пользоваться файлами.';
+  $('btn-login-submit').textContent = register ? 'Зарегистрироваться' : 'Войти';
+  $('btn-toggle-register').textContent = register
+    ? 'Уже есть аккаунт? Войти'
+    : 'Нет аккаунта? Зарегистрироваться';
+  $('et-login-password').autocomplete = register ? 'new-password' : 'current-password';
+  showProfileStep(
+    'layout-email-login',
+    register ? 'Регистрация по почте' : 'Вход по почте',
+    register ? 'Придумайте пароль для аккаунта' : 'Введите почту и пароль',
+  );
+}
+
+function fieldError(input, message) {
+  input.setCustomValidity(message);
+  input.reportValidity();
+  input.addEventListener('input', () => input.setCustomValidity(''), { once: true });
+}
+
+function submitEmailLogin(event) {
+  if (event) event.preventDefault();
+  const emailInput = $('et-login-email');
+  const passInput = $('et-login-password');
+  const confirmInput = $('et-login-password-confirm');
+  const email = emailInput.value.trim();
+  const password = passInput.value;
+
+  if (!isValidEmail(email)) {
+    fieldError(emailInput, 'Введите корректный email');
+    return;
+  }
+  if (state.registerMode) {
+    const passError = validateNewPassword(password);
+    if (passError) {
+      fieldError(passInput, passError);
+      return;
+    }
+    if (password !== confirmInput.value) {
+      fieldError(confirmInput, 'Пароли не совпадают!');
+      return;
+    }
+  } else if (!password) {
+    fieldError(passInput, 'Введите пароль!');
+    return;
+  }
+  const wait = authManager.cooldownSecondsLeft();
+  if (wait > 0) {
+    showToast('Слишком много неудачных попыток. Подождите ' + wait + ' с');
+    return;
+  }
+  if (state.registerMode) authManager.signUpWithEmail(email, password);
+  else authManager.signInWithEmail(email, password);
+}
+
+function onForgotPassword() {
+  const emailInput = $('et-login-email');
+  const email = emailInput.value.trim();
+  if (!isValidEmail(email)) {
+    fieldError(emailInput, 'Введите почту — на неё придёт ссылка для сброса пароля');
+    return;
+  }
+  authManager.sendPasswordReset(email);
+}
+
+// --- Таймер повторной отправки письма ---
+
+function stopResendTimer() {
+  if (state.resendTimer) {
+    clearInterval(state.resendTimer);
+    state.resendTimer = null;
+  }
+}
+
+function startResendTimer() {
+  stopResendTimer();
+  const btn = $('btn-verify-resend');
+  const tick = () => {
+    const left = authManager.verificationResendSecondsLeft();
+    if (left <= 0) {
+      btn.disabled = false;
+      btn.style.opacity = '';
+      btn.textContent = 'Отправить письмо ещё раз';
+      stopResendTimer();
+      return;
+    }
+    btn.disabled = true;
+    btn.style.opacity = '0.55';
+    btn.textContent = 'Отправить ещё раз через ' + left + ' с';
+  };
+  tick();
+  if (authManager.verificationResendSecondsLeft() > 0) state.resendTimer = setInterval(tick, 1000);
+}
 
 function bindAccountInfo(username) {
   const user = auth.currentUser;
@@ -229,7 +363,7 @@ async function loadStats() {
 }
 
 function refreshHome() {
-  const loggedIn = authManager.isLoggedIn;
+  const loggedIn = authManager.loggedIn();
   setVisible($('layout-guest'), !loggedIn);
   setVisible($('layout-files'), loggedIn);
   if (loggedIn) {
@@ -626,7 +760,7 @@ function showSendDialog(file) {
     }
     const me = auth.currentUser;
     try {
-      const hits = await searchUsersByNick(nick, me && me.email);
+      const hits = await searchUsersByNick(nick, me && me.email, me && me.uid);
       results.replaceChildren();
       if (!hits.length) {
         empty.hidden = false;
@@ -640,11 +774,10 @@ function showSendDialog(file) {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'user-hit';
+        // Показываем только ник — почту других пользователей не раскрываем.
         const n = document.createElement('strong');
         n.textContent = hit.username;
-        const e = document.createElement('span');
-        e.textContent = hit.email;
-        btn.append(n, e);
+        btn.append(n);
         btn.addEventListener('click', () => {
           dialog.close();
           sendTo(file, hit);
@@ -671,7 +804,7 @@ async function sendTo(file, hit) {
   if (!me || !me.email) return;
   setLoading(true);
   try {
-    await sendFileToUser(file, hit, me.email);
+    await sendFileToUser(file, hit, me.email, authManager.getCurrentUsername() || me.displayName);
     setLoading(false);
     showToast('Отправлено @' + hit.username);
   } catch (error) {
@@ -741,8 +874,7 @@ function refreshSettings() {
     input.checked = Number(input.value) === theme;
   });
   $('sw-confirm-delete').checked = confirmDeleteEnabled();
-  const loggedIn = authManager.isLoggedIn;
-  setVisible($('btn-settings-logout'), loggedIn);
+  setVisible($('btn-settings-logout'), !!auth.currentUser);
 }
 
 function clearAuthFields() {
@@ -750,6 +882,9 @@ function clearAuthFields() {
   $('et-mfa-pass').value = '';
   $('et-mfa-pass-confirm').value = '';
   $('et-check-pass').value = '';
+  $('et-login-email').value = '';
+  $('et-login-password').value = '';
+  $('et-login-password-confirm').value = '';
 }
 
 function bindUi() {
@@ -759,8 +894,17 @@ function bindUi() {
 
   $('btn-login').addEventListener('click', () => showView('profile'));
   $('btn-login-google').addEventListener('click', () => authManager.signInWithGoogle());
-  $('btn-login-phone').addEventListener('click', () => showToast('В разработке!'));
-  $('btn-login-email').addEventListener('click', () => showToast('В разработке!'));
+  $('btn-login-email').addEventListener('click', () => showEmailLogin(false));
+  $('layout-email-login').addEventListener('submit', submitEmailLogin);
+  $('btn-toggle-register').addEventListener('click', () => showEmailLogin(!state.registerMode));
+  $('btn-forgot-password').addEventListener('click', onForgotPassword);
+  $('btn-login-back').addEventListener('click', () => authManager.checkUserStatusAndRoute());
+  $('btn-verify-done').addEventListener('click', () => authManager.reloadAndCheckEmailVerified());
+  $('btn-verify-resend').addEventListener('click', () => authManager.resendVerificationEmail());
+  $('btn-verify-logout').addEventListener('click', () => {
+    stopResendTimer();
+    authManager.signOut(clearAuthFields);
+  });
 
   $('btn-next-username').addEventListener('click', () => {
     const username = $('et-username').value.trim();
@@ -776,8 +920,9 @@ function bindUi() {
   $('btn-save-password').addEventListener('click', () => {
     const pass = $('et-mfa-pass').value;
     const confirm = $('et-mfa-pass-confirm').value;
-    if (!pass || pass.length < 6) {
-      $('et-mfa-pass').setCustomValidity('Минимум 6 символов!');
+    const passError = validateNewPassword(pass);
+    if (passError) {
+      $('et-mfa-pass').setCustomValidity(passError);
       $('et-mfa-pass').reportValidity();
       return;
     }
@@ -890,7 +1035,7 @@ function boot() {
   onAuthStateChanged(auth, () => {
     if (auth.currentUser) {
       authManager.checkUserStatusAndRoute();
-    } else if (!authManager.isLoggedIn) {
+    } else if (!authManager.loggedIn()) {
       authManager.callback && authManager.callback.onUnauthenticated();
     } else {
       setLoading(false);

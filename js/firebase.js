@@ -5,4 +5,5 @@ import { firebaseConfig } from './config.js';
 
 export const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
+auth.languageCode = 'ru'; // письма подтверждения и сброса пароля — на русском
 export const db = getFirestore(app);

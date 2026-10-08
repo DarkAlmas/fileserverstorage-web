@@ -27,6 +27,7 @@ import {
   updateProfile,
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
 import {
+  deleteField,
   doc,
   getDoc,
   runTransaction,
@@ -37,6 +38,9 @@ import { auth, db } from './firebase.js';
 
 export const USERS = 'Users';
 export const USERNAMES = 'Usernames';
+/** Users/{uid}/private/profile: почта и служебные поля, читает только владелец. */
+export const PRIVATE = 'private';
+export const PRIVATE_PROFILE = 'profile';
 const NICK_TAKEN = 'nickname-taken';
 const NICKNAME_RE = /^[A-Za-zА-Яа-яЁё0-9_]{3,20}$/;
 
@@ -404,6 +408,7 @@ export class AuthManager {
         return data;
       }
       // Профиль есть, но ник ещё не закреплён в Usernames — закрепляем.
+      this.writePrivateProfile(user);
       await this.writeProfileClaimingNickname(user, this.profileFields(user), name);
       return data;
     }
@@ -417,21 +422,24 @@ export class AuthManager {
     }
     if (!legacy || !legacy.exists()) return null;
 
+    // Из старого документа берём только ник: остальные поля (в т.ч. почта)
+    // в публичный профиль не попадают — правила разрешают лишь публичные ключи.
     const merged = {
-      ...legacy.data(),
       ...this.profileFields(user),
       migratedFromEmailDoc: true,
       createdAt: serverTimestamp(),
     };
-    const name = typeof merged.userName === 'string' ? merged.userName : '';
+    this.writePrivateProfile(user);
+    const legacyName = legacy.data().userName;
+    const name = typeof legacyName === 'string' ? legacyName : '';
     if (!name) {
       // Ника в старом профиле нет — человек выберет его на шаге регистрации.
-      delete merged.userName;
       await setDoc(this.userDoc(user), merged, { merge: true }).catch((e) =>
         console.warn('migration write failed', e),
       );
       return null;
     }
+    merged.userName = name;
     merged.displayName = name;
     merged.userNameLower = nicknameKey(name);
     await this.writeProfileClaimingNickname(user, merged, name);
@@ -473,19 +481,37 @@ export class AuthManager {
     }
   }
 
+  /**
+   * Базовые поля ПУБЛИЧНОГО профиля Users/{uid}. Почты здесь нет: правила разрешают только
+   * uid, userName, displayName, userNameLower, nicknameClaimed, nicknameConflict, createdAt,
+   * migratedFromEmailDoc. Поля от тестовых сборок (email, providers, lastLoginAt) удаляются.
+   */
   profileFields(user) {
     return {
       uid: user.uid,
-      email: user.email,
-      providers: providerIds(user),
-      lastLoginAt: serverTimestamp(),
+      email: deleteField(),
+      providers: deleteField(),
+      lastLoginAt: deleteField(),
     };
   }
 
-  /** Обновляет служебные поля Users/{uid} (merge); ник здесь не меняется. */
+  /** Приватный документ Users/{uid}/private/profile — почта хранится только здесь. */
+  privateDoc(user) {
+    return doc(db, USERS, user.uid, PRIVATE, PRIVATE_PROFILE);
+  }
+
+  writePrivateProfile(user) {
+    return setDoc(
+      this.privateDoc(user),
+      { email: user.email || null, providers: providerIds(user), lastLoginAt: serverTimestamp() },
+      { merge: true },
+    ).catch((e) => console.warn('private profile write failed', e));
+  }
+
+  /** Обновляет служебные поля Users/{uid} и приватный документ (merge); ник здесь не меняется. */
   async upsertUserProfile(user, _unused) {
-    const data = this.profileFields(user);
-    await setDoc(this.userDoc(user), data, { merge: true });
+    this.writePrivateProfile(user);
+    await setDoc(this.userDoc(user), this.profileFields(user), { merge: true });
   }
 
   /** Регистрация ника: в одной транзакции занимаем Usernames/{ник} и пишем Users/{uid}. */
@@ -522,6 +548,7 @@ export class AuthManager {
         );
       });
       this.nicknameConflict = false;
+      this.writePrivateProfile(user);
       await this.updateDisplayName(user, username);
     } catch (error) {
       console.error('saveUsername', error);
@@ -561,7 +588,7 @@ export class AuthManager {
         tx.set(
           this.userDoc(user),
           {
-            uid: user.uid,
+            ...this.profileFields(user),
             userName: nickname,
             displayName: nickname,
             userNameLower: newKey,

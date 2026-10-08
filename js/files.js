@@ -8,7 +8,6 @@ import {
   doc,
   getDoc,
   getDocs,
-  limit,
   onSnapshot,
   orderBy,
   query,
@@ -16,6 +15,7 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
 import { MAX_STORAGE_BYTES, SIGNED_URL_TTL_OPEN } from './config.js';
 import { auth, db } from './firebase.js';
+import { nicknameKey, validateNickname } from './auth.js';
 import {
   createSignedUrl,
   deleteShare,
@@ -301,59 +301,26 @@ export async function deleteFolderRecord(folder) {
 }
 
 /**
- * Поиск по нику через Usernames/{ник} → Users/{uid}. Показывается только ник;
- * email не выводится. Если ник ещё не закреплён (старые профили) — точный поиск
- * по старым документам Users/{email}.
+ * Поиск по нику: только Usernames/{ник в нижнем регистре} → Users/{uid}. Запросов (list)
+ * по Users нет — правила их запрещают. Старый профиль, ещё не перенесённый (человек не
+ * входил в новую версию), не находится — ник закрепится при его первом входе.
+ * Почта получателя не читается и не показывается: для отправки нужен только UID.
  */
-export async function searchUsersByNick(nick, myEmail, myUid) {
+export async function searchUsersByNick(nick, _myEmail, myUid) {
   const text = String(nick || '').trim();
-  if (!text) return [];
-  const hits = [];
+  if (!text || validateNickname(text)) return [];
+  const claim = await getDoc(doc(db, 'Usernames', nicknameKey(text)));
+  if (!claim.exists()) return [];
+  const uid = claim.data().uid;
+  if (!uid || uid === myUid) return [];
+  let username = claim.data().userName || text;
   try {
-    const claim = await getDoc(doc(db, 'Usernames', text.toLowerCase()));
-    if (claim.exists()) {
-      const uid = claim.data().uid;
-      if (uid && uid !== myUid) {
-        let username = claim.data().userName || text;
-        let email = null;
-        try {
-          const user = await getDoc(doc(db, 'Users', uid));
-          if (user.exists()) {
-            username = user.data().displayName || user.data().userName || username;
-            email = user.data().email || null;
-          }
-        } catch (error) {
-          console.warn('user read failed', error);
-        }
-        hits.push({ email, uid, username });
-      }
-      return hits;
-    }
+    const user = await getDoc(doc(db, 'Users', uid));
+    if (user.exists() && user.data().displayName) username = user.data().displayName;
   } catch (error) {
-    console.warn('Usernames read failed', error);
+    console.warn('user read failed', error);
   }
-  return searchLegacyUsers(text, myEmail, myUid);
-}
-
-async function searchLegacyUsers(nick, myEmail, myUid) {
-  const snap = await getDocs(
-    query(collection(db, 'Users'), where('userName', '==', nick), limit(20)),
-  );
-  const hits = [];
-  const seen = new Set();
-  snap.forEach((d) => {
-    const data = d.data();
-    // Только старые профили Users/{email}: у новых ник обязан быть в Usernames.
-    if (!d.id.includes('@')) return;
-    const uid = data.uid || null;
-    if (!uid) return; // без UID отправить через public.shares нельзя
-    if (myUid && uid === myUid) return;
-    if (myEmail && d.id.toLowerCase() === myEmail.toLowerCase()) return;
-    if (seen.has(uid)) return;
-    seen.add(uid);
-    hits.push({ email: d.id, uid, username: data.displayName || data.userName || 'Пользователь' });
-  });
-  return hits;
+  return [{ uid, username }];
 }
 
 /**

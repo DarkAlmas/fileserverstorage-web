@@ -138,3 +138,85 @@ export async function createSignedUrl(storagePath, expiresInSeconds) {
   if (!signedURL) throw new Error('Sign response missing signedURL');
   return `${SUPABASE_URL}/storage/v1${signedURL}`;
 }
+
+// ---------------------------------------------------------------------------
+// Таблица public.shares (отправка файлов другим пользователям по UID).
+// Контракт: INSERT {owner_uid, recipient_uid, path, file_name}; path = users/<owner_uid>/<имя>,
+// файл уже лежит в бакете; входящие = recipient_uid = мой UID; UPDATE запрещён.
+// ---------------------------------------------------------------------------
+
+const SHARES_URL = `${SUPABASE_URL}/rest/v1/shares`;
+
+/** Путь подходит под контракт shares: users/<ownerUid>/<имя>, без «..». */
+export function isShareablePath(path, ownerUid) {
+  if (!path || !ownerUid || String(path).includes('..')) return false;
+  if (!/^[A-Za-z0-9]{1,128}$/.test(ownerUid)) return false;
+  const prefix = `users/${ownerUid}/`;
+  return path.startsWith(prefix) && path.length > prefix.length && !path.slice(prefix.length).includes('/');
+}
+
+export class ShareError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+export async function insertShare(ownerUid, recipientUid, path, fileName) {
+  if (!isShareablePath(path, ownerUid)) {
+    throw new ShareError('bad-path', 'Этот файл загружен в старом формате — отправить его пока нельзя');
+  }
+  const token = await firebaseIdToken();
+  const name = String(fileName || 'file').slice(0, 255) || 'file';
+  const response = await fetch(SHARES_URL, {
+    method: 'POST',
+    headers: authHeaders(token, { 'Content-Type': 'application/json', Prefer: 'return=minimal' }),
+    body: JSON.stringify({ owner_uid: ownerUid, recipient_uid: recipientUid, path, file_name: name }),
+  });
+  if (response.status === 409) {
+    throw new ShareError('already-shared', 'Этот файл уже отправлен этому пользователю');
+  }
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    console.error('Share insert failed', response.status, body);
+    throw new ShareError('error', 'Не удалось отправить файл');
+  }
+}
+
+/** Входящие: [{ id, owner_uid, path, file_name, created_at }] */
+export async function listIncomingShares(myUid) {
+  const token = await firebaseIdToken();
+  const url =
+    `${SHARES_URL}?select=id,owner_uid,path,file_name,created_at` +
+    `&recipient_uid=eq.${encodeURIComponent(myUid)}&order=created_at.desc`;
+  const response = await fetch(url, { headers: authHeaders(token) });
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(body || `Shares list failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+async function deleteShares(filter) {
+  const token = await firebaseIdToken();
+  const response = await fetch(`${SHARES_URL}?${filter}`, {
+    method: 'DELETE',
+    headers: authHeaders(token, { Prefer: 'return=minimal' }),
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(body || `Share delete failed: ${response.status}`);
+  }
+}
+
+/** Получатель убирает входящий файл у себя: удаляется только запись, файл остаётся у владельца. */
+export function deleteShare(shareId) {
+  return deleteShares(`id=eq.${encodeURIComponent(shareId)}`);
+}
+
+/** Владелец удалил файл — удаляем его отправки (триггер в БД делает то же самое). */
+export function deleteSharesForPath(ownerUid, path) {
+  return deleteShares(
+    `owner_uid=eq.${encodeURIComponent(ownerUid)}&path=eq.${encodeURIComponent(path)}`,
+  );
+}

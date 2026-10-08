@@ -7,6 +7,11 @@
  *
  * Документы Users хранятся по UID (Users/{uid}). Старый документ Users/{email}
  * при входе копируется в Users/{uid} и не удаляется.
+ *
+ * Ники уникальны: Usernames/{ник в нижнем регистре} = { uid, userName, createdAt }.
+ * Ник занимается в одной транзакции с профилем. Если при переносе старого профиля ник
+ * уже занят другим человеком, вход продолжается, но в профиле предлагается выбрать
+ * новый ник (nicknameConflict = true).
  */
 import {
   EmailAuthProvider,
@@ -22,18 +27,41 @@ import {
   updateProfile,
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
 import {
-  collection,
   doc,
   getDoc,
-  getDocs,
-  query,
+  runTransaction,
   serverTimestamp,
   setDoc,
-  where,
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
 import { auth, db } from './firebase.js';
 
 export const USERS = 'Users';
+export const USERNAMES = 'Usernames';
+const NICK_TAKEN = 'nickname-taken';
+const NICKNAME_RE = /^[A-Za-zА-Яа-яЁё0-9_]{3,20}$/;
+
+/** null — ник подходит; иначе текст ошибки. */
+export function validateNickname(nickname) {
+  const n = String(nickname || '').trim();
+  if (n.length < 3 || n.length > 20) return 'Ник должен быть от 3 до 20 символов';
+  if (!NICKNAME_RE.test(n)) return 'В нике можно использовать только буквы, цифры и _';
+  return null;
+}
+
+/** Ключ документа Usernames: без учёта регистра. */
+export function nicknameKey(nickname) {
+  return String(nickname).trim().toLowerCase();
+}
+
+function claimData(user, nickname) {
+  return { uid: user.uid, userName: String(nickname).trim(), createdAt: serverTimestamp() };
+}
+
+function nickTakenError() {
+  const err = new Error('Этот ник уже занят');
+  err.code = NICK_TAKEN;
+  return err;
+}
 export const MIN_PASSWORD_LENGTH = 8;
 export const VERIFICATION_RESEND_COOLDOWN_MS = 60 * 1000;
 
@@ -104,6 +132,12 @@ export class AuthManager {
     this.failedAttempts = 0;
     this.lockedUntil = 0;
     this.lastVerificationSentAt = 0;
+    this.nicknameConflict = false;
+  }
+
+  /** Ник из старого профиля занят другим — нужно выбрать новый. */
+  hasNicknameConflict() {
+    return this.nicknameConflict;
   }
 
   setCallback(callback) {
@@ -362,8 +396,16 @@ export class AuthManager {
   async loadOrMigrateUserDocument(user) {
     const snap = await getDoc(this.userDoc(user));
     if (snap.exists()) {
-      await this.upsertUserProfile(user, null);
-      return snap.data();
+      const data = snap.data();
+      const name = typeof data.userName === 'string' ? data.userName : '';
+      if (!name || data.nicknameClaimed === true) {
+        this.nicknameConflict = false;
+        await this.upsertUserProfile(user, null).catch((e) => console.warn('upsertUserProfile', e));
+        return data;
+      }
+      // Профиль есть, но ник ещё не закреплён в Usernames — закрепляем.
+      await this.writeProfileClaimingNickname(user, this.profileFields(user), name);
+      return data;
     }
     if (!user.email) return null;
 
@@ -381,9 +423,54 @@ export class AuthManager {
       migratedFromEmailDoc: true,
       createdAt: serverTimestamp(),
     };
-    if (merged.userName) merged.displayName = merged.userName;
-    await setDoc(this.userDoc(user), merged, { merge: true });
+    const name = typeof merged.userName === 'string' ? merged.userName : '';
+    if (!name) {
+      // Ника в старом профиле нет — человек выберет его на шаге регистрации.
+      delete merged.userName;
+      await setDoc(this.userDoc(user), merged, { merge: true }).catch((e) =>
+        console.warn('migration write failed', e),
+      );
+      return null;
+    }
+    merged.displayName = name;
+    merged.userNameLower = nicknameKey(name);
+    await this.writeProfileClaimingNickname(user, merged, name);
     return legacy.data();
+  }
+
+  /**
+   * Транзакция: занимает Usernames/{ник} (если свободен) и пишет профиль Users/{uid}.
+   * Если ник занят другим (или не подходит по формату) — nicknameConflict = true.
+   * Ошибки не прерывают вход.
+   */
+  async writeProfileClaimingNickname(user, profile, nickname) {
+    const validFormat = validateNickname(nickname) === null;
+    const claimRef = doc(db, USERNAMES, nicknameKey(nickname));
+    try {
+      const conflict = await runTransaction(db, async (tx) => {
+        let isConflict = true;
+        let claimNow = false;
+        if (validFormat) {
+          const claim = await tx.get(claimRef);
+          if (!claim.exists()) {
+            claimNow = true;
+            isConflict = false;
+          } else {
+            isConflict = claim.data().uid !== user.uid;
+          }
+        }
+        if (claimNow) tx.set(claimRef, claimData(user, nickname));
+        tx.set(
+          this.userDoc(user),
+          { ...profile, nicknameConflict: isConflict, nicknameClaimed: !isConflict },
+          { merge: true },
+        );
+        return isConflict;
+      });
+      this.nicknameConflict = conflict;
+    } catch (error) {
+      console.warn('nickname claim failed', error);
+    }
   }
 
   profileFields(user) {
@@ -395,38 +482,107 @@ export class AuthManager {
     };
   }
 
-  /** Обновляет Users/{uid} (merge). userName !== null — при регистрации ника. */
-  async upsertUserProfile(user, userName) {
+  /** Обновляет служебные поля Users/{uid} (merge); ник здесь не меняется. */
+  async upsertUserProfile(user, _unused) {
     const data = this.profileFields(user);
-    if (userName !== null) {
-      data.userName = userName;
-      data.displayName = userName;
-      data.createdAt = serverTimestamp();
-    }
     await setDoc(this.userDoc(user), data, { merge: true });
   }
 
-  async saveUsername(username) {
+  /** Регистрация ника: в одной транзакции занимаем Usernames/{ник} и пишем Users/{uid}. */
+  async saveUsername(rawUsername) {
     const cb = this.callback;
     const user = auth.currentUser;
     if (!cb || !user) return;
+    const username = String(rawUsername || '').trim();
+    const formatError = validateNickname(username);
+    if (formatError) {
+      cb.onError(formatError);
+      return;
+    }
 
     cb.onShowLoading();
+    const claimRef = doc(db, USERNAMES, nicknameKey(username));
     try {
-      const snap = await getDocs(query(collection(db, USERS), where('userName', '==', username)));
-      const taken = snap.docs.some((d) => d.data().uid !== user.uid);
-      if (taken) {
-        cb.onHideLoading();
-        cb.onError('Этот ник уже занят');
-        return;
-      }
-      await this.upsertUserProfile(user, username);
+      await runTransaction(db, async (tx) => {
+        const claim = await tx.get(claimRef);
+        if (claim.exists() && claim.data().uid !== user.uid) throw nickTakenError();
+        if (!claim.exists()) tx.set(claimRef, claimData(user, username));
+        tx.set(
+          this.userDoc(user),
+          {
+            ...this.profileFields(user),
+            userName: username,
+            displayName: username,
+            userNameLower: nicknameKey(username),
+            nicknameClaimed: true,
+            nicknameConflict: false,
+            createdAt: serverTimestamp(),
+          },
+          { merge: true },
+        );
+      });
+      this.nicknameConflict = false;
       await this.updateDisplayName(user, username);
     } catch (error) {
       console.error('saveUsername', error);
       cb.onHideLoading();
-      cb.onError('Ошибка сохранения в БД');
+      cb.onError(error && error.code === NICK_TAKEN ? 'Этот ник уже занят' : 'Ошибка сохранения в БД');
     }
+  }
+
+  /** Смена ника (например, если старый оказался занят): новый занимаем, старый освобождаем. */
+  async changeNickname(rawNickname) {
+    const cb = this.callback;
+    const user = auth.currentUser;
+    if (!cb || !user) return;
+    const nickname = String(rawNickname || '').trim();
+    const formatError = validateNickname(nickname);
+    if (formatError) {
+      cb.onError(formatError);
+      return;
+    }
+    const oldName = this.currentUsername || '';
+    const newKey = nicknameKey(nickname);
+    const oldKey = oldName ? nicknameKey(oldName) : null;
+    const newRef = doc(db, USERNAMES, newKey);
+    const oldRef =
+      oldKey && oldKey !== newKey && validateNickname(oldName) === null
+        ? doc(db, USERNAMES, oldKey)
+        : null;
+
+    cb.onShowLoading();
+    try {
+      await runTransaction(db, async (tx) => {
+        const claim = await tx.get(newRef);
+        const oldClaim = oldRef ? await tx.get(oldRef) : null;
+        if (claim.exists() && claim.data().uid !== user.uid) throw nickTakenError();
+        if (!claim.exists()) tx.set(newRef, claimData(user, nickname));
+        if (oldClaim && oldClaim.exists() && oldClaim.data().uid === user.uid) tx.delete(oldRef);
+        tx.set(
+          this.userDoc(user),
+          {
+            uid: user.uid,
+            userName: nickname,
+            displayName: nickname,
+            userNameLower: newKey,
+            nicknameClaimed: true,
+            nicknameConflict: false,
+          },
+          { merge: true },
+        );
+      });
+    } catch (error) {
+      console.error('changeNickname', error);
+      cb.onHideLoading();
+      cb.onError(error && error.code === NICK_TAKEN ? 'Этот ник уже занят' : 'Не удалось сменить ник');
+      return;
+    }
+    this.nicknameConflict = false;
+    this.currentUsername = nickname;
+    updateProfile(user, { displayName: nickname }).catch((e) => console.warn('updateProfile', e));
+    cb.onHideLoading();
+    cb.onInfo('Ник изменён на «' + nickname + '»');
+    cb.onUserAuthenticated(nickname, true);
   }
 
   async linkPassword(password) {
@@ -522,6 +678,7 @@ export class AuthManager {
     this.isLoggedIn = false;
     this.currentUsername = '';
     this.isFirstLoginAfterAppStart = false;
+    this.nicknameConflict = false;
   }
 }
 

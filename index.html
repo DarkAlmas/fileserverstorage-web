@@ -169,7 +169,7 @@
           <p class="profile-subtitle">Выберите удобный способ для авторизации</p>
           <label class="field-label">
             Придумайте Username
-            <input type="text" class="field" id="et-username" autocomplete="username" maxlength="40">
+            <input type="text" class="field" id="et-username" autocomplete="username" maxlength="20">
           </label>
           <button type="button" class="btn btn-primary btn-block" id="btn-next-username">Далее</button>
         </div>
@@ -223,6 +223,10 @@
           </div>
         </div>
 
+        <div class="card" id="card-nickname-conflict" hidden style="padding:12px 16px;margin:12px 0;border:1px solid #e0a800;text-align:left">
+          <p id="tv-nickname-conflict" style="margin:0 0 8px">Ваш ник уже занят другим пользователем. Выберите новый ник — пока что его видят только вы.</p>
+          <button type="button" class="btn btn-tonal btn-block" id="btn-change-nickname">Выбрать новый ник</button>
+        </div>
         <button type="button" class="btn btn-primary btn-block" id="btn-open-files">Перейти к файлам</button>
         <button type="button" class="btn btn-tonal btn-block btn-danger-text" id="btn-logout">Выйти из аккаунта</button>
       </div>

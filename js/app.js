@@ -7,6 +7,7 @@ import {
   isValidEmail,
   MIN_PASSWORD_LENGTH,
   validateNewPassword,
+  validateNickname,
 } from './auth.js';
 import { UploadTooLargeError, uploadFile } from './storage.js';
 import {
@@ -22,6 +23,8 @@ import {
   getDisplayName,
   goUpPath,
   isInboxFolder,
+  isReceived,
+  loadIncomingShareItems,
   isReservedFolderName,
   listenUserFiles,
   loadAccountStats,
@@ -43,6 +46,9 @@ const $ = (id) => document.getElementById(id);
 const state = {
   view: 'home',
   allFiles: [],
+  firestoreFiles: [],
+  incomingShares: [],
+  sharesRequestId: 0,
   currentFolder: '',
   filesUnsub: null,
   menuItem: null,
@@ -204,6 +210,8 @@ authManager.setCallback({
     stopFilesListener();
     state.currentFolder = '';
     state.allFiles = [];
+    state.firestoreFiles = [];
+    state.incomingShares = [];
     refreshHome();
     refreshSettings();
   },
@@ -347,7 +355,32 @@ function bindAccountInfo(username) {
 function showDashboard() {
   hideAllProfileSteps();
   setVisible($('layout-dashboard'), true);
+  setVisible($('card-nickname-conflict'), authManager.hasNicknameConflict());
   loadStats();
+}
+
+function showChangeNicknameDialog() {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'field';
+  input.maxLength = 20;
+  input.placeholder = 'Новый ник (3–20 символов: буквы, цифры, _)';
+  input.autocomplete = 'off';
+  openDialog({
+    title: 'Новый ник',
+    node: input,
+    confirmLabel: 'Сохранить',
+    onConfirm: () => {
+      const nick = input.value.trim();
+      const error = validateNickname(nick);
+      if (error) {
+        showToast(error);
+        return;
+      }
+      authManager.changeNickname(nick);
+    },
+    afterOpen: () => input.focus(),
+  });
 }
 
 async function loadStats() {
@@ -388,15 +421,35 @@ function loadUserFiles() {
   state.filesUnsub = listenUserFiles(
     user.email,
     (items, totalSize) => {
-      state.allFiles = items;
+      state.firestoreFiles = items;
       updateStorageInfo(totalSize);
-      renderFiles();
+      mergeFiles();
     },
     (error) => {
       console.error(error);
       showToast('Ошибка загрузки списка: ' + (error.message || error));
     },
   );
+  loadIncomingShares();
+}
+
+function mergeFiles() {
+  state.allFiles = state.firestoreFiles.concat(state.incomingShares);
+  renderFiles();
+}
+
+/** Входящие файлы из Supabase public.shares (recipient_uid = мой UID). */
+async function loadIncomingShares() {
+  const requestId = ++state.sharesRequestId;
+  try {
+    const items = await loadIncomingShareItems();
+    if (requestId !== state.sharesRequestId || !authManager.loggedIn()) return;
+    state.incomingShares = items;
+    mergeFiles();
+  } catch (error) {
+    // Таблица недоступна — показываем только свои файлы.
+    console.warn('incoming shares failed', error);
+  }
 }
 
 function updateStorageInfo(usedBytes) {
@@ -545,7 +598,7 @@ function showItemMenu(item, anchor) {
     if (!isInboxFolder(item)) add('Удалить', () => confirmDelete(item));
   } else {
     add('Скачать', () => openStoredFile(item));
-    add('Отправить', () => showSendDialog(item));
+    if (!isReceived(item)) add('Отправить', () => showSendDialog(item));
     add('Удалить', () => confirmDelete(item));
   }
 
@@ -610,6 +663,10 @@ async function deleteItem(item) {
   setLoading(true);
   try {
     await deleteFileItem(item);
+    if (item.shareId) {
+      state.incomingShares = state.incomingShares.filter((x) => x.shareId !== item.shareId);
+      mergeFiles();
+    }
     setLoading(false);
     showToast('Файл удалён');
   } catch (error) {
@@ -617,7 +674,7 @@ async function deleteItem(item) {
     setLoading(false);
     showToast(error.message === 'Ошибка удаления файла из Storage'
       ? error.message
-      : 'Ошибка удаления из БД');
+      : item.shareId ? 'Не удалось удалить файл' : 'Ошибка удаления из БД');
   }
 }
 
@@ -801,20 +858,20 @@ function showSendDialog(file) {
 
 async function sendTo(file, hit) {
   const me = auth.currentUser;
-  if (!me || !me.email) return;
+  if (!me) return;
   setLoading(true);
   try {
-    await sendFileToUser(file, hit, me.email, authManager.getCurrentUsername() || me.displayName);
+    await sendFileToUser(file, hit);
     setLoading(false);
     showToast('Отправлено @' + hit.username);
   } catch (error) {
     console.error(error);
     setLoading(false);
-    showToast(
-      error.message === 'Не удалось получить ссылку на файл'
-        ? error.message
-        : 'Не удалось отправить: ' + (error.message || error),
-    );
+    if (error && error.code === 'already-shared') {
+      showToast('Этот файл уже отправлен @' + hit.username);
+      return;
+    }
+    showToast(error && error.message ? error.message : 'Не удалось отправить файл');
   }
 }
 
@@ -913,6 +970,12 @@ function bindUi() {
       $('et-username').reportValidity();
       return;
     }
+    const nickError = validateNickname(username);
+    if (nickError) {
+      $('et-username').setCustomValidity(nickError);
+      $('et-username').reportValidity();
+      return;
+    }
     $('et-username').setCustomValidity('');
     authManager.saveUsername(username);
   });
@@ -950,6 +1013,7 @@ function bindUi() {
   });
 
   $('btn-done').addEventListener('click', showDashboard);
+  $('btn-change-nickname').addEventListener('click', showChangeNicknameDialog);
   $('btn-logout').addEventListener('click', () => authManager.signOut(clearAuthFields));
   $('btn-open-files').addEventListener('click', () => showView('home'));
   $('btn-open-storage').addEventListener('click', () => showView('home'));

@@ -6,6 +6,7 @@ import {
   collection,
   deleteDoc,
   doc,
+  getDoc,
   getDocs,
   limit,
   onSnapshot,
@@ -13,9 +14,16 @@ import {
   query,
   where,
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
-import { MAX_STORAGE_BYTES, SIGNED_URL_TTL_OPEN, SIGNED_URL_TTL_UPLOAD } from './config.js';
+import { MAX_STORAGE_BYTES, SIGNED_URL_TTL_OPEN } from './config.js';
 import { auth, db } from './firebase.js';
-import { createSignedUrl, deleteStoredFile } from './storage.js';
+import {
+  createSignedUrl,
+  deleteShare,
+  deleteSharesForPath,
+  deleteStoredFile,
+  insertShare,
+  listIncomingShares,
+} from './storage.js';
 
 export const INBOX_PREFIX = '!';
 export { MAX_STORAGE_BYTES };
@@ -71,6 +79,13 @@ export function formatFileInfo(item) {
   if (item.isFolder) {
     return isInboxFolder(item) ? 'Входящие файлы' : 'Папка';
   }
+  if (item.shareId) {
+    // У входящих из public.shares размер неизвестен — показываем только дату.
+    const d = item.uploadedAt
+      ? new Date(item.uploadedAt).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short', year: 'numeric' })
+      : '';
+    return 'Получен' + (d ? ' · ' + d : '');
+  }
   const date = item.uploadedAt
     ? new Date(item.uploadedAt).toLocaleDateString('ru-RU', {
         day: 'numeric',
@@ -124,7 +139,7 @@ export function listenUserFiles(ownerEmail, onChange, onError) {
       snapshots.forEach((d) => {
         const item = fromFirestore(d.id, d.data());
         items.push(item);
-        if (!item.isFolder) totalSize += item.size;
+        if (!item.isFolder && !isReceived(item)) totalSize += item.size;
       });
       onChange(items, totalSize);
     },
@@ -226,6 +241,11 @@ export async function addFileRecord(file, result, ownerEmail, folder) {
 }
 
 export async function deleteFileItem(item) {
+  if (item.shareId) {
+    // Входящий файл из public.shares: удаляем только запись, файл остаётся у владельца.
+    await deleteShare(item.shareId);
+    return;
+  }
   const received = isReceived(item);
   if (!received && item.storagePath) {
     try {
@@ -235,8 +255,31 @@ export async function deleteFileItem(item) {
       err.cause = error;
       throw err;
     }
+    // Отправки этого файла (триггер в БД удаляет их тоже — это страховка).
+    const me = auth.currentUser;
+    if (me) {
+      deleteSharesForPath(me.uid, item.storagePath).catch((e) =>
+        console.warn('delete shares failed', e),
+      );
+      deleteLegacyShares(item.storagePath, me.email).catch((e) =>
+        console.warn('delete legacy shares failed', e),
+      );
+    }
   }
   await deleteDoc(doc(db, 'Files', item.id));
+}
+
+/** Старые «отправки» (копии в Files от прошлых версий) этого файла. */
+async function deleteLegacyShares(storagePath, myEmail) {
+  if (!myEmail) return;
+  const snap = await getDocs(
+    query(
+      collection(db, 'Files'),
+      where('sharedBy', '==', myEmail),
+      where('storagePath', '==', storagePath),
+    ),
+  );
+  await Promise.all(snap.docs.map((d) => deleteDoc(d.ref)));
 }
 
 export function folderHasFiles(allFiles, folder) {
@@ -258,11 +301,41 @@ export async function deleteFolderRecord(folder) {
 }
 
 /**
- * Поиск по нику. Email нужен только для записи Files.ownerEmail получателя —
- * в интерфейсе показывается только ник. Старый (Users/{email}) и новый
- * (Users/{uid}) документ одного человека дают один результат.
+ * Поиск по нику через Usernames/{ник} → Users/{uid}. Показывается только ник;
+ * email не выводится. Если ник ещё не закреплён (старые профили) — точный поиск
+ * по старым документам Users/{email}.
  */
 export async function searchUsersByNick(nick, myEmail, myUid) {
+  const text = String(nick || '').trim();
+  if (!text) return [];
+  const hits = [];
+  try {
+    const claim = await getDoc(doc(db, 'Usernames', text.toLowerCase()));
+    if (claim.exists()) {
+      const uid = claim.data().uid;
+      if (uid && uid !== myUid) {
+        let username = claim.data().userName || text;
+        let email = null;
+        try {
+          const user = await getDoc(doc(db, 'Users', uid));
+          if (user.exists()) {
+            username = user.data().displayName || user.data().userName || username;
+            email = user.data().email || null;
+          }
+        } catch (error) {
+          console.warn('user read failed', error);
+        }
+        hits.push({ email, uid, username });
+      }
+      return hits;
+    }
+  } catch (error) {
+    console.warn('Usernames read failed', error);
+  }
+  return searchLegacyUsers(text, myEmail, myUid);
+}
+
+async function searchLegacyUsers(nick, myEmail, myUid) {
   const snap = await getDocs(
     query(collection(db, 'Users'), where('userName', '==', nick), limit(20)),
   );
@@ -270,48 +343,77 @@ export async function searchUsersByNick(nick, myEmail, myUid) {
   const seen = new Set();
   snap.forEach((d) => {
     const data = d.data();
-    const email = data.email || (d.id.includes('@') ? d.id : null);
-    if (!email) return;
+    // Только старые профили Users/{email}: у новых ник обязан быть в Usernames.
+    if (!d.id.includes('@')) return;
     const uid = data.uid || null;
-    if (myEmail && email.toLowerCase() === myEmail.toLowerCase()) return;
+    if (!uid) return; // без UID отправить через public.shares нельзя
     if (myUid && uid === myUid) return;
-    const key = uid || email.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    hits.push({ email, uid, username: data.displayName || data.userName || 'Пользователь' });
+    if (myEmail && d.id.toLowerCase() === myEmail.toLowerCase()) return;
+    if (seen.has(uid)) return;
+    seen.add(uid);
+    hits.push({ email: d.id, uid, username: data.displayName || data.userName || 'Пользователь' });
   });
   return hits;
 }
 
-export async function sendFileToUser(file, hit, myEmail, senderName) {
-  if (!file.storagePath) {
-    throw new Error('Не удалось получить ссылку на файл');
+/**
+ * Отправка через Supabase public.shares: INSERT {owner_uid, recipient_uid, path, file_name}.
+ * Файл уже лежит в бакете; получатель создаёт ссылку сам в момент открытия.
+ */
+export async function sendFileToUser(file, hit) {
+  const me = auth.currentUser;
+  if (!me) throw new Error('Вы не авторизованы');
+  if (!hit || !hit.uid) {
+    throw new Error('Не удалось определить получателя. Пусть он войдёт в новую версию приложения');
   }
-  let signedUrl;
+  await insertShare(me.uid, hit.uid, file.storagePath, file.name);
+}
+
+const senderNames = new Map();
+
+async function senderName(uid) {
+  if (senderNames.has(uid)) return senderNames.get(uid);
+  let name = 'пользователя';
   try {
-    signedUrl = await createSignedUrl(file.storagePath, SIGNED_URL_TTL_UPLOAD);
+    const snap = await getDoc(doc(db, 'Users', uid));
+    if (snap.exists()) name = snap.data().displayName || snap.data().userName || name;
   } catch (error) {
-    throw new Error('Не удалось получить ссылку на файл');
+    console.warn('sender read failed', error);
   }
-  await addDoc(collection(db, 'Files'), {
-    name: file.name,
-    storagePath: file.storagePath,
-    downloadUrl: signedUrl,
-    size: file.size,
-    uploadedAt: Date.now(),
-    ownerEmail: hit.email,
-    ownerUid: hit.uid || null,
-    contentType: file.contentType,
-    // Папка у получателя «От: <ник>» — email отправителя не показываем.
-    parent: inboxFolderFor(String(senderName || 'пользователя').replace(/\//g, '_')),
-    isFolder: false,
-    sharedBy: myEmail,
-    sharedByUid: auth.currentUser ? auth.currentUser.uid : null,
-  });
+  name = String(name).replace(/\//g, '_');
+  senderNames.set(uid, name);
+  return name;
+}
+
+/** Входящие из public.shares как элементы списка в папках «От: <ник>». */
+export async function loadIncomingShareItems() {
+  const me = auth.currentUser;
+  if (!me) return [];
+  const rows = await listIncomingShares(me.uid);
+  const items = [];
+  for (const row of rows) {
+    const name = await senderName(row.owner_uid);
+    items.push({
+      id: 'share:' + row.id,
+      shareId: row.id,
+      name: row.file_name || 'file',
+      storagePath: row.path,
+      downloadUrl: '',
+      size: 0,
+      uploadedAt: row.created_at ? Date.parse(row.created_at) || 0 : 0,
+      ownerEmail: '',
+      contentType: '',
+      isFolder: false,
+      parent: inboxFolderFor(name),
+      sharedBy: row.owner_uid,
+    });
+  }
+  return items;
 }
 
 export async function openFileUrl(item) {
-  if (!isReceived(item) && item.storagePath) {
+  // Свой файл или входящий из public.shares — ссылку создаём в момент открытия.
+  if ((!isReceived(item) || item.shareId) && item.storagePath) {
     return createSignedUrl(item.storagePath, SIGNED_URL_TTL_OPEN);
   }
   return item.downloadUrl || null;

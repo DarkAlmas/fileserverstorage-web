@@ -25,6 +25,7 @@ import {
   isInboxFolder,
   isReceived,
   loadIncomingShareItems,
+  migrateLegacyFiles,
   isReservedFolderName,
   listenUserFiles,
   loadAccountStats,
@@ -417,6 +418,8 @@ function stopFilesListener() {
 function loadUserFiles() {
   const user = auth.currentUser;
   if (!user || !user.email) return;
+  // Перенос старых записей на users/<uid>/... (один раз за сессию, в фоне).
+  migrateLegacyFiles();
   stopFilesListener();
   state.filesUnsub = listenUserFiles(
     user.email,

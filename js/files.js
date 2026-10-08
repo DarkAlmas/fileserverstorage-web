@@ -12,6 +12,7 @@ import {
   orderBy,
   query,
   where,
+  writeBatch,
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
 import { MAX_STORAGE_BYTES, SIGNED_URL_TTL_OPEN } from './config.js';
 import { auth, db } from './firebase.js';
@@ -423,3 +424,87 @@ export function pathTitle(currentFolder) {
   return displayFolderName(leaf);
 }
 
+
+// ---------------------------------------------------------------------------
+// Перенос старых записей Files на новые пути в бакете (как LegacyFileMigration.java).
+// Объекты users/<email с _at_>/X уже скопированы в users/<uid>/X (старые оставлены). Правила
+// делают storagePath неизменяемым, поэтому создаётся НОВАЯ запись (id = <старый id>_u,
+// storagePath = users/<uid>/X, ownerUid = uid, без downloadUrl и sharedBy*) и в том же batch
+// (атомарно) удаляется старая. Папки не трогаем: дерево строится по строке parent, а не по id.
+// Входящие «отправки» (sharedBy) не переносятся. Объекты в бакете не удаляются.
+// Один раз за сессию на UID, после входа с подтверждённой почтой.
+// ---------------------------------------------------------------------------
+
+let migrationDoneFor = null;
+let migrationRunningFor = null;
+
+export function legacyNewPath(oldPath, uid) {
+  if (!oldPath || oldPath.startsWith(`users/${uid}/`)) return null;
+  const name = oldPath.substring(oldPath.lastIndexOf('/') + 1);
+  if (!name || name === '.' || name === '..') return null;
+  return `users/${uid}/${name}`;
+}
+
+export function legacyNewRecord(old, uid, email, newPath) {
+  const data = { ...old };
+  delete data.downloadUrl;
+  delete data.sharedBy;
+  delete data.sharedByUid;
+  data.storagePath = newPath;
+  data.ownerUid = uid;
+  data.ownerEmail = email;
+  data.migratedFrom = old.storagePath;
+  return data;
+}
+
+export async function migrateLegacyFiles() {
+  const user = auth.currentUser;
+  if (!user || !user.email) return null;
+  const { uid, email } = user;
+  if (migrationDoneFor === uid || migrationRunningFor === uid) return null;
+  migrationRunningFor = uid;
+  const stats = { migrated: 0, skipped: 0, failed: 0 };
+  try {
+    const mine = new Map();
+    const byEmail = await getDocs(query(collection(db, 'Files'), where('ownerEmail', '==', email)));
+    byEmail.forEach((d) => mine.set(d.id, d));
+    try {
+      const byUid = await getDocs(query(collection(db, 'Files'), where('ownerUid', '==', uid)));
+      byUid.forEach((d) => mine.set(d.id, d));
+    } catch (error) {
+      console.warn('migration: query by ownerUid failed', error);
+    }
+    for (const old of mine.values()) {
+      const data = old.data();
+      if (data.isFolder || data.sharedBy || data.sharedByUid) continue;
+      const newPath = legacyNewPath(data.storagePath, uid);
+      if (!newPath) continue;
+      // Объект должен уже лежать по новому пути (его скопировали на сервере).
+      try {
+        await createSignedUrl(newPath, 60);
+      } catch (error) {
+        console.warn(`migration: skip ${old.id}: no object at ${newPath} (old record kept)`);
+        stats.skipped += 1;
+        continue;
+      }
+      const batch = writeBatch(db);
+      batch.set(doc(db, 'Files', old.id + '_u'), legacyNewRecord(data, uid, email, newPath));
+      batch.delete(old.ref);
+      try {
+        await batch.commit();
+        stats.migrated += 1;
+      } catch (error) {
+        console.warn(`migration: ${old.id} failed (old record kept)`, error);
+        stats.failed += 1;
+      }
+    }
+    migrationDoneFor = uid;
+    console.info('legacy migration', stats);
+    return stats;
+  } catch (error) {
+    console.warn('legacy migration failed, will retry next session', error);
+    return null;
+  } finally {
+    if (migrationRunningFor === uid) migrationRunningFor = null;
+  }
+}
